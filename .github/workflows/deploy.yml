@@ -1,0 +1,77 @@
+name: CI/CD Pipeline - M-Motors FastAPI to AWS ECS
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: "eu-west-3"
+  AWS_ACCOUNT_ID: "123456789012"
+  REPOSITORY_NAME: "m-motors-fastapi"
+  IMAGE_TAG: "latest"
+  ECS_SERVICE: "m-motors-service"
+  ECS_CLUSTER: "m-motors-cluster"
+  ECS_TASK_DEFINITION: ".aws/task-definition.json"
+  CONTAINER_NAME: "fastapi-app"
+
+jobs:
+  # Test unitaire dans un conteneur Docker sur l'environnement Python 3.11-slim (comme la prod)
+  test:
+    name: Run Unit Tests inside Docker Container
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Build de l'image Docker de test
+        run: |
+          docker build -t m-motors-test:local .
+
+      - name: Exécution du test unitaire (MY Test) dans l'environnement Python 3.11-slim
+        run: |
+          docker run --rm m-motors-test:local pytest
+
+  # Build, Push de l'image Docker sur Amazon ECR et Déploiement sur AWS ECS
+  build-and-deploy:
+    name: Build, Push ECR & Deploy ECS
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Configuration des identifiants AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Connexion à Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag et Push de l'image
+        id: build-image
+        run: |
+          ECR_URI="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.REPOSITORY_NAME }}"
+          docker build -t ${{ env.REPOSITORY_NAME }}:${{ env.IMAGE_TAG }} .
+          docker tag ${{ env.REPOSITORY_NAME }}:${{ env.IMAGE_TAG }} $ECR_URI:${{ env.IMAGE_TAG }}
+          docker push $ECR_URI:${{ env.IMAGE_TAG }}
+          echo "image=$ECR_URI:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
+
+      - name: Mise à jour de la Task Definition ECS
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Déploiement sur le cluster AWS ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
